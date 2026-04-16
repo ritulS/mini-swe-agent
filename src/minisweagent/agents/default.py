@@ -187,6 +187,61 @@ class DefaultAgent:
         #
         _primitive = os.environ.get("MSWEA_PRIMITIVE", "")
         _budget    = int(os.environ.get("MSWEA_TOKEN_BUDGET", "0") or "0")
+
+        # ── Online TRC hook ──────────────────────────────────────────────────
+        # Fires every step (no budget needed) when primitive == "online_trc".
+        # The model emits NEED_RESULT: <flag> in its response.  At call n+2 we
+        # apply that flag to the tool result from call n (messages[-3]).
+        #
+        # Warmup: skip the first 5 calls so early exploration is never cleared.
+        # Guard:  need ≥4 compressible messages (2 full steps) for [-4]/[-3].
+        # Graceful degradation: if [-4] has no valid flag, default = "full" (no-op).
+        if _primitive == "online_trc" and self.n_calls >= 5 and len(self.messages) >= 6:
+            import re as _re
+            import memory as _mem_otrc
+            _asst_msg    = self.messages[-4]  # assistant from call n (has NEED_RESULT flag)
+            _result_msg  = self.messages[-3]  # tool result from call n  (target for clearing)
+            _asst_content = _asst_msg.get("content") or ""
+            if isinstance(_asst_content, list):
+                _asst_content = " ".join(
+                    b.get("text", "") for b in _asst_content if isinstance(b, dict)
+                )
+            _flag_match = _re.search(
+                r"NEED_RESULT:\s*(none|first_half|second_half|full)",
+                str(_asst_content),
+                _re.IGNORECASE,
+            )
+            _flag = _flag_match.group(1).lower() if _flag_match else "full"
+
+            _orig_content = _result_msg.get("content") or ""
+            _orig_tokens  = _mem_otrc.count_tokens([_result_msg])
+            _new_content  = _orig_content  # default: no change
+
+            if _flag == "none":
+                _new_content = f"[TOOL OUTPUT CLEARED — online-trc — {_orig_tokens} tokens — step {self.n_calls - 2}]"
+            elif _flag == "first_half":
+                _mid = max(1, len(str(_orig_content)) // 2)
+                _new_content = str(_orig_content)[:_mid] + "\n[...truncated by online-trc (first_half)...]"
+            elif _flag == "second_half":
+                _mid = max(1, len(str(_orig_content)) // 2)
+                _new_content = "[...truncated by online-trc (second_half)...]\n" + str(_orig_content)[_mid:]
+            # "full" → no change
+
+            if _flag != "full":
+                self.messages[-3] = {**_result_msg, "content": _new_content}
+
+            _tokens_saved_otrc = max(0, _orig_tokens - _mem_otrc.count_tokens([self.messages[-3]]))
+            self._mem_online_trc_flags.append({
+                "step":           self.n_calls,        # call number when clearing happens
+                "flag_from_step": self.n_calls - 2,    # call that emitted the flag
+                "flag":           _flag,
+                "flag_found":     _flag_match is not None,
+                "tokens_cleared": _tokens_saved_otrc,
+            })
+            self._mem_online_trc_tokens_saved += _tokens_saved_otrc
+            _mem_otrc.write_token_log(self)
+        # ── End online TRC hook ──────────────────────────────────────────────
+
         if _primitive and _budget > 0:
             import memory as _mem   # agentCtx root must be on PYTHONPATH
             # Measure the current context window size (= full history size).
