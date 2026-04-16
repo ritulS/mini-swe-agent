@@ -72,6 +72,9 @@ class InteractiveAgent(DefaultAgent):
             with console.status("Waiting for the LM to respond..."):
                 return super().query()
         except LimitsExceeded:
+            import sys
+            if not sys.stdin.isatty():
+                raise  # non-interactive: propagate cleanly so run() can handle it
             console.print(
                 f"Limits exceeded. Limits: {self.config.step_limit} steps, ${self.config.cost_limit}.\n"
                 f"Current spend: {self.n_calls} steps, ${self.cost:.2f}."

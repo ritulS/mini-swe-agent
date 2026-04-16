@@ -4,6 +4,8 @@ or https://minimal-agent.com for a tutorial on the basic building principles.
 
 import json
 import logging
+import os
+import time
 import traceback
 from pathlib import Path
 
@@ -41,6 +43,27 @@ class DefaultAgent:
         self.logger = logging.getLogger("agent")
         self.cost = 0.0
         self.n_calls = 0
+
+        # ── Memory primitive accumulators (written to MSWEA_TOKEN_LOG_PATH) ──
+        self._mem_prompt_tokens      = 0
+        self._mem_completion_tokens  = 0
+        self._mem_total_latency      = 0.0
+        self._mem_call_latencies: list[float] = []
+        self._mem_compression_events        = 0
+        self._mem_tokens_saved              = 0
+        self._mem_compression_ratios: list[float] = []
+        self._mem_summarization_prompt_tokens = 0
+        self._mem_summarization_latency_s     = 0.0
+        # per-step and per-compression-event detail
+        self._mem_step_prompt_tokens: list[int] = []
+        self._mem_step_completion_tokens: list[int] = []
+        self._mem_compression_event_steps: list[int] = []
+        self._mem_context_tokens_at_compression: list[int] = []
+        self._mem_context_tokens_after_compression: list[int] = []
+        self._mem_trc_fallback_events               = 0
+        # online TRC accumulators
+        self._mem_online_trc_flags: list[str] = []
+        self._mem_online_trc_tokens_saved: int = 0
 
     def get_template_vars(self, **kwargs) -> dict:
         return recursive_merge(
@@ -101,7 +124,21 @@ class DefaultAgent:
         return self.execute_actions(self.query())
 
     def query(self) -> dict:
-        """Query the model and return model messages. Override to add hooks."""
+        """Query the model and return model messages.
+
+        Memory primitive hook
+        ---------------------
+        Reads two environment variables before every LLM call:
+          MSWEA_PRIMITIVE    : "truncation" | "summarization"
+          MSWEA_TOKEN_BUDGET : int  — fires when estimated prompt tokens exceed this
+
+        When the budget is hit, the chosen primitive compresses self.messages down
+        to budget * 0.5 tokens (compression ratio r = 0.5), keeping the system
+        prompt and first user message (task statement) protected.
+
+        Token usage and compression stats are accumulated on self._mem_* and written
+        to MSWEA_TOKEN_LOG_PATH (if set) after every call.
+        """
         if 0 < self.config.step_limit <= self.n_calls or 0 < self.config.cost_limit <= self.cost:
             raise LimitsExceeded(
                 {
@@ -110,10 +147,131 @@ class DefaultAgent:
                     "extra": {"exit_status": "LimitsExceeded", "submission": ""},
                 }
             )
+
+        # ── Memory primitive hook ────────────────────────────────────────────
+        #
+        # WHAT IS self.messages?
+        #   The full conversation history accumulated so far:
+        #     messages[0]  — system prompt (never changes)
+        #     messages[1]  — user message containing the task (never changes)
+        #     messages[2+] — alternating assistant/user messages from each step
+        #   On every LLM call (model.query below), the ENTIRE history is sent.
+        #   So the history IS the context window.
+        #
+        # WHAT IS THE BUDGET?
+        #   MSWEA_TOKEN_BUDGET is a token count threshold for the context window.
+        #   It is set by run_experiment.py as:
+        #     budget = max(step_prompt_tokens from baseline run) * budget_pct
+        #   e.g. if the baseline peak context was 40K and budget_pct=0.60,
+        #   budget = 24K.  Compression fires when the history exceeds 24K tokens.
+        #   At p100 (baseline) the budget is set to 999999999 so it never fires.
+        #
+        # TRIGGER: context window size > budget
+        #   We measure the current history size with count_tokens(self.messages)
+        #   using tiktoken (cl100k_base, accurate to ~5% across models).
+        #   This is checked BEFORE each LLM call, so compression always happens
+        #   before the model sees an oversized context.
+        #   No reset is needed: after compression the history shrinks below budget,
+        #   so the check naturally won't fire again until the history grows back.
+        #
+        # WHAT COMPRESSION DOES:
+        #   Both primitives protect messages[0:2] (system + task) — never touched.
+        #   They operate only on messages[2:] (the agent's working history).
+        #   target = current_size * COMPRESSION_RATIO (0.5) — compress to 50%.
+        #
+        #   truncation  — drops the oldest messages from the front of messages[2:]
+        #                 until size <= target.  No extra LLM call.
+        #   summarization — one extra LLM call produces a structured summary of
+        #                 messages[2:], which replaces the entire compressible
+        #                 window with a single summary message.
+        #
+        _primitive = os.environ.get("MSWEA_PRIMITIVE", "")
+        _budget    = int(os.environ.get("MSWEA_TOKEN_BUDGET", "0") or "0")
+        if _primitive and _budget > 0:
+            import memory as _mem   # agentCtx root must be on PYTHONPATH
+            # Measure the current context window size (= full history size).
+            # This is what the model would receive on the next call.
+            _current = _mem.count_tokens(self.messages)
+            if _current > _budget:
+                # History has grown past the budget — compress it now.
+                # Target: reduce to 50% of current size.
+                _target = max(1, int(_current * _mem.COMPRESSION_RATIO))
+                if _primitive == "summarization":
+                    # LLM call produces a structured summary replacing messages[2:].
+                    # Tokens used by that summary call are tracked separately so we
+                    # can distinguish them from the main agent's token usage.
+                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.summarize(
+                        self.messages, self.model, _target
+                    )
+                    self._mem_prompt_tokens              += _pt
+                    self._mem_completion_tokens          += _ct
+                    self._mem_summarization_prompt_tokens += _pt
+                    self._mem_summarization_latency_s    += _sum_lat
+                elif _primitive == "structured_summarize":
+                    # LLM call produces a schema-guided summary (Task / Files Modified /
+                    # Files Examined / Execution Anchors / Current State).
+                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.structured_summarize(
+                        self.messages, self.model, _target
+                    )
+                    self._mem_prompt_tokens               += _pt
+                    self._mem_completion_tokens           += _ct
+                    self._mem_summarization_prompt_tokens += _pt
+                    self._mem_summarization_latency_s     += _sum_lat
+                elif _primitive == "tool_result_clear":
+                    # Stubs out bash output bodies oldest-first; falls back to
+                    # truncate() if clearing alone is insufficient.
+                    self.messages, _saved, _trc_fallback = _mem.tool_result_clear(self.messages, _target)
+                    if _trc_fallback:
+                        self._mem_trc_fallback_events += 1
+                elif _primitive == "scored_tool_result_clear":
+                    # Ranked clearing: stubs out bash output bodies lowest-score first.
+                    # Score = type_weight × size + citation_boost (ACT-R inspired).
+                    # Falls back to truncate() if scored clearing is insufficient.
+                    self.messages, _saved, _trc_fallback = _mem.scored_tool_result_clear(self.messages, _target)
+                    if _trc_fallback:
+                        self._mem_trc_fallback_events += 1
+                else:  # truncation
+                    # Drop oldest messages from messages[2:] until size <= target.
+                    self.messages, _saved = _mem.truncate(self.messages, _target)
+
+                # Record event metadata for the token log.
+                _after = _mem.count_tokens(self.messages)
+                if _current > 0:
+                    self._mem_compression_ratios.append(_after / _current)
+                self._mem_compression_events += 1
+                self._mem_tokens_saved       += _saved
+                self._mem_compression_event_steps.append(self.n_calls)
+                self._mem_context_tokens_at_compression.append(_current)
+                self._mem_context_tokens_after_compression.append(_after)
+                # No reset of _mem_prompt_tokens needed: the trigger now checks
+                # current context size directly, which is already small after
+                # compression.  It will not fire again until history grows back.
+        # ────────────────────────────────────────────────────────────────────
+
         self.n_calls += 1
-        message = self.model.query(self.messages)
+        _t0      = time.time()
+        message  = self.model.query(self.messages)
+        _latency = time.time() - _t0
+
         self.cost += message.get("extra", {}).get("cost", 0.0)
         self.add_messages(message)
+
+        # ── Accumulate token usage and write log ─────────────────────────────
+        _extra = message.get("extra", {})
+        _resp  = _extra.get("response", {})
+        _usage = _resp.get("usage", {}) if isinstance(_resp, dict) else {}
+        _step_pt = _usage.get("prompt_tokens", 0) or 0
+        _step_ct = _usage.get("completion_tokens", 0) or 0
+        self._mem_prompt_tokens     += _step_pt
+        self._mem_completion_tokens += _step_ct
+        self._mem_total_latency     += _latency
+        self._mem_call_latencies.append(_latency)
+        self._mem_step_prompt_tokens.append(_step_pt)
+        self._mem_step_completion_tokens.append(_step_ct)
+        if _primitive and _budget > 0:
+            _mem.write_token_log(self)
+        # ────────────────────────────────────────────────────────────────────
+
         return message
 
     def execute_actions(self, message: dict) -> list[dict]:
