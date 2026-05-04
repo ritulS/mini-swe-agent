@@ -189,53 +189,32 @@ class DefaultAgent:
         _budget    = int(os.environ.get("MSWEA_TOKEN_BUDGET", "0") or "0")
 
         # ── Online TRC hook ──────────────────────────────────────────────────
-        # Fires every step (no budget needed) when primitive == "online_trc".
-        # The model emits NEED_RESULT: <flag> in its response.  At call n+2 we
-        # apply that flag to the tool result from call n (messages[-3]).
-        #
-        # Warmup: skip the first 5 calls so early exploration is never cleared.
-        # Guard:  need ≥4 compressible messages (2 full steps) for [-4]/[-3].
-        # Graceful degradation: if [-4] has no valid flag, default = "full" (no-op).
-        if _primitive == "online_trc" and self.n_calls >= 5 and len(self.messages) >= 6:
-            import re as _re
+        # Online TRC: freeze-window clearing.
+        # Protect the last FREEZE_K tool results; unconditionally clear the
+        # oldest result outside the window every step.
+        # FREEZE_K=4: target = messages[-9] (result from step n-5),
+        #             guard  = len(messages) ≥ 10.
+        _FREEZE_K   = 4
+        _result_idx = -(2 * _FREEZE_K + 1)   # -9 for FREEZE_K=4
+        _min_len    = 2 * (_FREEZE_K + 1)     # 10 for FREEZE_K=4
+        _OTRC_FAMILY = (
+            "online_trc",
+            "online_trc_summarize_partial",
+            "online_trc_structured_summarize_partial",
+        )
+        if _primitive in _OTRC_FAMILY and self.n_calls >= 5 and len(self.messages) >= _min_len:
             import memory as _mem_otrc
-            _asst_msg    = self.messages[-4]  # assistant from call n (has NEED_RESULT flag)
-            _result_msg  = self.messages[-3]  # tool result from call n  (target for clearing)
-            _asst_content = _asst_msg.get("content") or ""
-            if isinstance(_asst_content, list):
-                _asst_content = " ".join(
-                    b.get("text", "") for b in _asst_content if isinstance(b, dict)
-                )
-            _flag_match = _re.search(
-                r"NEED_RESULT:\s*(none|first_half|second_half|full)",
-                str(_asst_content),
-                _re.IGNORECASE,
-            )
-            _flag = _flag_match.group(1).lower() if _flag_match else "full"
 
-            _orig_content = _result_msg.get("content") or ""
+            _result_msg   = self.messages[_result_idx]
             _orig_tokens  = _mem_otrc.count_tokens([_result_msg])
-            _new_content  = _orig_content  # default: no change
+            _step_cleared = self.n_calls - (_FREEZE_K + 1)
+            _new_content  = f"[tool-result cleared — online-trc — {_orig_tokens} tok — step {_step_cleared}]"
+            self.messages[_result_idx] = {**_result_msg, "content": _new_content}
 
-            if _flag == "none":
-                _new_content = f"[TOOL OUTPUT CLEARED — online-trc — {_orig_tokens} tokens — step {self.n_calls - 2}]"
-            elif _flag == "first_half":
-                _mid = max(1, len(str(_orig_content)) // 2)
-                _new_content = str(_orig_content)[:_mid] + "\n[...truncated by online-trc (first_half)...]"
-            elif _flag == "second_half":
-                _mid = max(1, len(str(_orig_content)) // 2)
-                _new_content = "[...truncated by online-trc (second_half)...]\n" + str(_orig_content)[_mid:]
-            # "full" → no change
-
-            if _flag != "full":
-                self.messages[-3] = {**_result_msg, "content": _new_content}
-
-            _tokens_saved_otrc = max(0, _orig_tokens - _mem_otrc.count_tokens([self.messages[-3]]))
+            _tokens_saved_otrc = max(0, _orig_tokens - _mem_otrc.count_tokens([self.messages[_result_idx]]))
             self._mem_online_trc_flags.append({
-                "step":           self.n_calls,        # call number when clearing happens
-                "flag_from_step": self.n_calls - 2,    # call that emitted the flag
-                "flag":           _flag,
-                "flag_found":     _flag_match is not None,
+                "step":           self.n_calls,
+                "flag_from_step": _step_cleared,
                 "tokens_cleared": _tokens_saved_otrc,
             })
             self._mem_online_trc_tokens_saved += _tokens_saved_otrc
@@ -272,6 +251,24 @@ class DefaultAgent:
                     self._mem_completion_tokens           += _ct
                     self._mem_summarization_prompt_tokens += _pt
                     self._mem_summarization_latency_s     += _sum_lat
+                elif _primitive == "summarization_partial":
+                    # SU-partial: summarize the head, keep the budget-fitting tail verbatim.
+                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.summarize_partial(
+                        self.messages, self.model, _target
+                    )
+                    self._mem_prompt_tokens               += _pt
+                    self._mem_completion_tokens           += _ct
+                    self._mem_summarization_prompt_tokens += _pt
+                    self._mem_summarization_latency_s     += _sum_lat
+                elif _primitive == "structured_summarize_partial":
+                    # SS-partial: structured-summarize the head, keep budget-fitting tail verbatim.
+                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.structured_summarize_partial(
+                        self.messages, self.model, _target
+                    )
+                    self._mem_prompt_tokens               += _pt
+                    self._mem_completion_tokens           += _ct
+                    self._mem_summarization_prompt_tokens += _pt
+                    self._mem_summarization_latency_s     += _sum_lat
                 elif _primitive == "tool_result_clear":
                     # Stubs out bash output bodies oldest-first; falls back to
                     # truncate() if clearing alone is insufficient.
@@ -285,6 +282,126 @@ class DefaultAgent:
                     self.messages, _saved, _trc_fallback = _mem.scored_tool_result_clear(self.messages, _target)
                     if _trc_fallback:
                         self._mem_trc_fallback_events += 1
+                elif _primitive == "trc_summarize":
+                    # Stage 1: TRC (clear tool outputs oldest-first, no TR fallback).
+                    self.messages, _saved, _ = _mem.tool_result_clear(
+                        self.messages, _target, fallback_truncate=False
+                    )
+                    # Stage 2: if still over budget, summarize the remaining history.
+                    _after_trc = _mem.count_tokens(self.messages)
+                    if _after_trc > _budget:
+                        _target2 = max(1, int(_after_trc * _mem.COMPRESSION_RATIO))
+                        self.messages, _saved2, _pt, _ct, _sum_lat = _mem.summarize(
+                            self.messages, self.model, _target2
+                        )
+                        _saved += _saved2
+                        self._mem_prompt_tokens               += _pt
+                        self._mem_completion_tokens           += _ct
+                        self._mem_summarization_prompt_tokens += _pt
+                        self._mem_summarization_latency_s     += _sum_lat
+                elif _primitive == "trc_structured_summarize":
+                    # Stage 1: TRC (clear tool outputs oldest-first, no TR fallback).
+                    self.messages, _saved, _ = _mem.tool_result_clear(
+                        self.messages, _target, fallback_truncate=False
+                    )
+                    # Stage 2: if still over budget, structured-summarize the remaining history.
+                    _after_trc = _mem.count_tokens(self.messages)
+                    if _after_trc > _budget:
+                        _target2 = max(1, int(_after_trc * _mem.COMPRESSION_RATIO))
+                        self.messages, _saved2, _pt, _ct, _sum_lat = _mem.structured_summarize(
+                            self.messages, self.model, _target2
+                        )
+                        _saved += _saved2
+                        self._mem_prompt_tokens               += _pt
+                        self._mem_completion_tokens           += _ct
+                        self._mem_summarization_prompt_tokens += _pt
+                        self._mem_summarization_latency_s     += _sum_lat
+                elif _primitive == "online_trc":
+                    # OTRC+TR: freeze window already cleared messages[-9] above;
+                    # truncation fires here as the budget-time fallback.
+                    self.messages, _saved = _mem.truncate(self.messages, _target)
+                elif _primitive == "online_trc_summarize_partial":
+                    # OTRC+SU-partial: freeze window cleared messages[-9] above;
+                    # SU-partial fires as the budget-time fallback (head summarized,
+                    # budget-fitting tail kept verbatim — preserves OTRC's freeze window).
+                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.summarize_partial(
+                        self.messages, self.model, _target
+                    )
+                    self._mem_prompt_tokens               += _pt
+                    self._mem_completion_tokens           += _ct
+                    self._mem_summarization_prompt_tokens += _pt
+                    self._mem_summarization_latency_s     += _sum_lat
+                elif _primitive == "online_trc_structured_summarize_partial":
+                    # OTRC+SS-partial: same as OTRC+SU-partial but with structured summary.
+                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.structured_summarize_partial(
+                        self.messages, self.model, _target
+                    )
+                    self._mem_prompt_tokens               += _pt
+                    self._mem_completion_tokens           += _ct
+                    self._mem_summarization_prompt_tokens += _pt
+                    self._mem_summarization_latency_s     += _sum_lat
+                elif _primitive in ("staggered_alternate", "staggered_random"):
+                    # Staggered: at each compression event, pick one of the
+                    # oracle-optimal pair (TR + budget-best). Pair is fixed by budget.
+                    _STAGGERED_PAIRS = {
+                        10000: ("truncation", "trc_structured_summarize"),
+                        15000: ("truncation", "summarization_partial"),
+                        20000: ("truncation", "trc_structured_summarize"),
+                    }
+                    if _budget not in _STAGGERED_PAIRS:
+                        raise RuntimeError(
+                            f"staggered: no pair defined for budget {_budget}; "
+                            f"add an entry in _STAGGERED_PAIRS"
+                        )
+                    _p1, _p2 = _STAGGERED_PAIRS[_budget]
+
+                    _idx = getattr(self, "_staggered_event_idx", 0)
+                    if _primitive == "staggered_alternate":
+                        _picked = _p1 if _idx % 2 == 0 else _p2
+                    else:  # staggered_random
+                        if not hasattr(self, "_staggered_rng"):
+                            import random as _stg_random
+                            self._staggered_rng = _stg_random.Random(
+                                hash(os.environ.get("MSWEA_RUN_KEY", ""))
+                            )
+                        _picked = _p1 if self._staggered_rng.random() < 0.5 else _p2
+
+                    if not hasattr(self, "_staggered_log"):
+                        self._staggered_log = []
+                    self._staggered_log.append(_picked)
+
+                    # Dispatch to the picked underlying primitive.
+                    if _picked == "truncation":
+                        self.messages, _saved = _mem.truncate(self.messages, _target)
+                    elif _picked == "summarization_partial":
+                        self.messages, _saved, _pt, _ct, _sum_lat = _mem.summarize_partial(
+                            self.messages, self.model, _target
+                        )
+                        self._mem_prompt_tokens               += _pt
+                        self._mem_completion_tokens           += _ct
+                        self._mem_summarization_prompt_tokens += _pt
+                        self._mem_summarization_latency_s     += _sum_lat
+                    elif _picked == "trc_structured_summarize":
+                        # TRC stage (no truncate fallback).
+                        self.messages, _saved, _ = _mem.tool_result_clear(
+                            self.messages, _target, fallback_truncate=False
+                        )
+                        # SS fallback if still over budget.
+                        _after_trc = _mem.count_tokens(self.messages)
+                        if _after_trc > _budget:
+                            _target2 = max(1, int(_after_trc * _mem.COMPRESSION_RATIO))
+                            self.messages, _saved2, _pt, _ct, _sum_lat = _mem.structured_summarize(
+                                self.messages, self.model, _target2
+                            )
+                            _saved += _saved2
+                            self._mem_prompt_tokens               += _pt
+                            self._mem_completion_tokens           += _ct
+                            self._mem_summarization_prompt_tokens += _pt
+                            self._mem_summarization_latency_s     += _sum_lat
+                    else:
+                        raise RuntimeError(f"staggered: unknown picked primitive {_picked}")
+
+                    self._staggered_event_idx = _idx + 1
                 else:  # truncation
                     # Drop oldest messages from messages[2:] until size <= target.
                     self.messages, _saved = _mem.truncate(self.messages, _target)
@@ -351,6 +468,7 @@ class DefaultAgent:
                 "mini_version": __version__,
                 "exit_status": last_extra.get("exit_status", ""),
                 "submission": last_extra.get("submission", ""),
+                "staggered_log": getattr(self, "_staggered_log", []),
             },
             "messages": self.messages,
             "trajectory_format": "mini-swe-agent-1.1",
