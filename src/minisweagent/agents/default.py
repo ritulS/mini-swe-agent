@@ -188,6 +188,15 @@ class DefaultAgent:
         _primitive = os.environ.get("MSWEA_PRIMITIVE", "")
         _budget    = int(os.environ.get("MSWEA_TOKEN_BUDGET", "0") or "0")
 
+        # ── ProbeCtrl full per-step context logging (additive; inert unless the
+        #    MSWEA_FULL_CONTEXT_LOG_DIR env var is set). Captures the exact context
+        #    sent to the model each step, plus the pre-compression context whenever
+        #    a compression event fires, so every event's full-vs-compressed pair is
+        #    reconstructable with a Δ=0 checksum against the recorded prompt_tokens. ──
+        _pc_dir   = os.environ.get("MSWEA_FULL_CONTEXT_LOG_DIR", "")
+        _pc_pre   = None     # pre-compression context snapshot (set iff compression fires this step)
+        _pc_fired = False
+
         # ── Online TRC hook ──────────────────────────────────────────────────
         # Online TRC: freeze-window clearing.
         # Protect the last FREEZE_K tool results; unconditionally clear the
@@ -230,6 +239,10 @@ class DefaultAgent:
                 # History has grown past the budget — compress it now.
                 # Target: reduce to 50% of current size.
                 _target = max(1, int(_current * _mem.COMPRESSION_RATIO))
+                if _pc_dir:
+                    import copy as _pc_copy
+                    _pc_pre   = _pc_copy.deepcopy(self.messages)  # full context entering compression
+                    _pc_fired = True
                 if _primitive == "summarization":
                     # LLM call produces a structured summary replacing messages[2:].
                     # Tokens used by that summary call are tracked separately so we
@@ -421,6 +434,9 @@ class DefaultAgent:
         # ────────────────────────────────────────────────────────────────────
 
         self.n_calls += 1
+        if _pc_dir:
+            import copy as _pc_copy2
+            _pc_sent = _pc_copy2.deepcopy(self.messages)  # exact context sent to the model this step
         _t0      = time.time()
         message  = self.model.query(self.messages)
         _latency = time.time() - _t0
@@ -440,6 +456,21 @@ class DefaultAgent:
         self._mem_call_latencies.append(_latency)
         self._mem_step_prompt_tokens.append(_step_pt)
         self._mem_step_completion_tokens.append(_step_ct)
+        if _pc_dir:
+            import json as _pc_json
+            from pathlib import Path as _PcPath
+            _pc_rec = {
+                "step": self.n_calls,                      # 1-based call index (matches step_prompt_tokens order)
+                "recorded_prompt_tokens": _step_pt,        # for Δ=0 checksum of sent_context
+                "compressed_this_step": _pc_fired,
+                "sent_context": _pc_sent,                  # exact context the model saw this step (post-compression)
+                "pre_compression_context": _pc_pre,        # full context before compression (None unless fired)
+                "response_text": message.get("content", ""),  # the action produced from sent_context (P-ACT teacher-forces this)
+            }
+            _pcd = _PcPath(_pc_dir)
+            _pcd.mkdir(parents=True, exist_ok=True)
+            with open(_pcd / "full_context_log.jsonl", "a") as _pcf:
+                _pcf.write(_pc_json.dumps(_pc_rec) + "\n")
         if _primitive and _budget > 0:
             _mem.write_token_log(self)
         # ────────────────────────────────────────────────────────────────────

@@ -33,8 +33,10 @@ class DockerEnvironmentConfig(BaseModel):
     """
     container_timeout: str = "2h"
     """Max duration to keep container running. Uses the same format as the sleep command."""
-    pull_timeout: int = 120
-    """Timeout in seconds for pulling images."""
+    pull_timeout: int = 600
+    """Timeout in seconds for pulling images. Bumped 120→600 after 2026-05-06 docker
+    cold-pull cascade incident: 16 concurrent workers hammering uncached images caused
+    every concurrent pull to exceed 120s; 473 runs landed as zero-step silent_crash."""
     interpreter: list[str] = ["bash", "-lc"]
     """Interpreter to use to execute commands. Default is ["bash", "-lc"].
     The actual command will be appended as argument to this. Override this to e.g., modify shell flags
